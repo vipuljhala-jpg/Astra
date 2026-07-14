@@ -495,19 +495,29 @@ with st.sidebar:
     st.divider()
     st.header("🎤 Wake word (hands-free)")
     if not WAKE_DEPS_OK:
-        st.warning(f"Wake-word packages missing:\n`{WAKE_DEPS_ERR}`\n\nRun: `pip install pvporcupine sounddevice numpy`")
-    pico_key = secret("PICOVOICE_ACCESS_KEY") or st.text_input(
-        "Picovoice AccessKey", type="password", help="Free at console.picovoice.ai"
-    )
-    wake_enabled = st.toggle("Always listening", value=bool(WAKE_DEPS_OK and pico_key),
-                             disabled=not (WAKE_DEPS_OK and pico_key))
-    keyword = st.selectbox("Built-in wake word", BUILTIN_KEYWORDS, index=0,
-                           help="Instant option. For 'Hey Astra', train it free on console.picovoice.ai and set the .ppn path below.")
-    keyword_path = st.text_input("Custom .ppn path (optional)", placeholder=r"C:\path\Hey-Astra_en_windows.ppn")
-    sensitivity = st.slider("Wake sensitivity", 0.1, 1.0, 0.6, 0.05)
-    mic_threshold = st.slider("Speech threshold (endpointing)", 100, 1500, 350, 50,
-                              help="Raise if it never stops recording (noisy room); lower if it cuts you off.")
-    greeting_text = st.text_input("Wake greeting", value="Yes? How can I help you?")
+        st.info(
+            "Hands-free 'Hey Astra' works only when this app runs **locally on "
+            "your own machine** (the server needs direct mic access). On this "
+            "deployment, use 🎙️ Push-to-talk or typing below — the full voice "
+            "pipeline still works!",
+            icon="ℹ️",
+        )
+        pico_key, wake_enabled = "", False
+        keyword, keyword_path, sensitivity, mic_threshold = "jarvis", "", 0.6, 350
+        greeting_text = "Yes? How can I help you?"
+    else:
+        pico_key = secret("PICOVOICE_ACCESS_KEY") or st.text_input(
+            "Picovoice AccessKey", type="password", help="Free at console.picovoice.ai"
+        )
+        wake_enabled = st.toggle("Always listening", value=bool(pico_key),
+                                 disabled=not pico_key)
+        keyword = st.selectbox("Built-in wake word", BUILTIN_KEYWORDS, index=0,
+                               help="Instant option. For 'Hey Astra', train it free on console.picovoice.ai and set the .ppn path below.")
+        keyword_path = st.text_input("Custom .ppn path (optional)", placeholder=r"C:\path\Hey-Astra_en_windows.ppn")
+        sensitivity = st.slider("Wake sensitivity", 0.1, 1.0, 0.6, 0.05)
+        mic_threshold = st.slider("Speech threshold (endpointing)", 100, 1500, 350, 50,
+                                  help="Raise if it never stops recording (noisy room); lower if it cuts you off.")
+        greeting_text = st.text_input("Wake greeting", value="Yes? How can I help you?")
 
     voice_on = st.toggle("🔊 Voice replies (TTS)", value=True)
 
