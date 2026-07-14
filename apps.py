@@ -1,31 +1,66 @@
 """
-🔵 Astra — Build-Your-Own-Alexa (single-file Streamlit demo)
+🔵 Astra — Build-Your-Own-Alexa (single-file Streamlit demo, WAKE-WORD edition)
 
-Flow:  🎙 mic → Sarvam STT → Claude (tool-calling) → Sarvam TTS → 🔊
+Flow:
+    (always listening) "Hey Astra / Jarvis / Alexa…"  → wake!
+        → Astra greets you: "Yes, how can I help?"
+        → your question is auto-recorded (stops when you stop speaking)
+        → Sarvam STT → Claude (tool-calling) → Sarvam TTS → 🔊 spoken reply
+        → back to listening for the wake word
 
-Run:
+How the always-on part works (real Alexa architecture, miniaturized):
+    A background thread owns the microphone via `sounddevice` and runs
+    Picovoice Porcupine (on-device wake-word engine — same tech class as
+    Echo's wake chip). Nothing is sent anywhere until the wake word fires.
+    After wake, simple energy-based endpointing records until ~1.2s of
+    silence, then pushes the WAV into a queue. A Streamlit fragment polls
+    the queue and runs the normal STT → Claude → TTS turn.
+
+IMPORTANT — this only works when the app runs on the SAME machine as the
+microphone (i.e. `streamlit run app.py` on your laptop, opened at
+localhost). Deployed on a server, the server has no mic — use the
+push-to-talk button instead (still included as fallback).
+
+Setup:
     pip install -r requirements.txt
-    streamlit run app.py
+    1) Get a FREE Picovoice AccessKey at https://console.picovoice.ai
+    2) (Optional) Train the custom wake word "Hey Astra" in that console,
+       download the .ppn file for Windows, and put its path in the sidebar.
+       Until then, use a built-in keyword like "jarvis" or "alexa".
+    3) Keys: either .streamlit/secrets.toml with
+           ANTHROPIC_API_KEY = "sk-ant-..."
+           SARVAM_API_KEY = "..."
+           PICOVOICE_ACCESS_KEY = "..."
+       or paste them in the sidebar.
 
-Paste your Anthropic + Sarvam API keys in the sidebar — nothing else needed.
-Weather (Open-Meteo) and music (iTunes previews) are free, no keys required.
-
-Latency notes (already applied):
-  - claude-haiku (fastest Claude) with a tight system prompt + low max_tokens
-  - one shared requests.Session (connection reuse ≈ 100-300 ms saved per call)
-  - Anthropic client created once and cached, not per request
-  - single-round tool use in most turns; hard cap of 3 rounds
+Tip: use headphones — otherwise the mic can hear Astra's own voice/music.
 """
 
 import base64
 import hashlib
+import io
 import json
+import queue
+import threading
+import time
+import wave
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import anthropic
 import requests
 import streamlit as st
+
+# Audio deps are optional — app still runs (push-to-talk + text) without them
+try:
+    import numpy as np
+    import sounddevice as sd
+    import pvporcupine
+    WAKE_DEPS_OK = True
+    WAKE_DEPS_ERR = ""
+except Exception as _e:  # ImportError or missing PortAudio
+    WAKE_DEPS_OK = False
+    WAKE_DEPS_ERR = str(_e)
 
 # =============================================================================
 # Page setup + styling
@@ -46,13 +81,13 @@ st.markdown(
     </style>
     <div class="astra-ring">🎙️</div>
     <p class="astra-title">Astra</p>
-    <p class="astra-sub">Your own Alexa — STT → Claude tools → TTS</p>
+    <p class="astra-sub">Say the wake word — hands free, like Alexa</p>
     """,
     unsafe_allow_html=True,
 )
 
 # =============================================================================
-# Shared HTTP session (connection reuse = lower latency)
+# Shared HTTP session + cached Claude client (latency)
 # =============================================================================
 @st.cache_resource
 def http() -> requests.Session:
@@ -67,7 +102,7 @@ def claude_client(api_key: str) -> anthropic.Anthropic:
 
 
 # =============================================================================
-# Skills (Alexa's "intents") — weather, time, music
+# Skills (Alexa's "intents")
 # =============================================================================
 WMO_CODES = {
     0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
@@ -206,8 +241,7 @@ def play_music(query: str) -> dict:
 def convert_currency(amount: float, from_currency: str, to_currency: str) -> dict:
     try:
         resp = http().get(
-            f"https://open.er-api.com/v6/latest/{from_currency.upper()}",
-            timeout=8,
+            f"https://open.er-api.com/v6/latest/{from_currency.upper()}", timeout=8,
         ).json()
         if resp.get("result") != "success":
             return {"error": f"Could not fetch rates for {from_currency}."}
@@ -222,9 +256,7 @@ def convert_currency(amount: float, from_currency: str, to_currency: str) -> dic
 
 def get_joke() -> dict:
     try:
-        data = http().get(
-            "https://official-joke-api.appspot.com/random_joke", timeout=8
-        ).json()
+        data = http().get("https://official-joke-api.appspot.com/random_joke", timeout=8).json()
         return {"setup": data["setup"], "punchline": data["punchline"]}
     except Exception as exc:
         return {"error": f"Joke fetch failed: {exc}"}
@@ -238,7 +270,10 @@ def search_wikipedia(query: str) -> dict:
         ).json()
         if resp.get("type") == "disambiguation" or "extract" not in resp:
             return {"error": f"No clear Wikipedia article for '{query}'."}
-        return {"title": resp["title"], "summary": resp["extract"][:400], "url": resp.get("content_urls", {}).get("desktop", {}).get("page", "")}
+        return {
+            "title": resp["title"], "summary": resp["extract"][:400],
+            "url": resp.get("content_urls", {}).get("desktop", {}).get("page", ""),
+        }
     except Exception as exc:
         return {"error": f"Wikipedia lookup failed: {exc}"}
 
@@ -260,7 +295,7 @@ def execute_tool(name: str, args: dict) -> dict:
 
 
 # =============================================================================
-# Brain — Claude tool-calling loop (replaces Alexa's NLU/intent router)
+# Brain — Claude tool-calling loop
 # =============================================================================
 SYSTEM_PROMPT = (
     "You are Astra, a friendly voice assistant like Alexa. Your replies are spoken "
@@ -276,7 +311,7 @@ def run_assistant(messages: list, api_key: str) -> tuple[str, list]:
     client = claude_client(api_key)
     convo = list(messages)
     tool_events = []
-    for _ in range(3):  # hard cap on tool rounds — keeps worst-case latency bounded
+    for _ in range(3):
         resp = client.messages.create(
             model="claude-haiku-4-5", max_tokens=300,
             system=SYSTEM_PROMPT, tools=TOOLS, messages=convo,
@@ -337,51 +372,157 @@ def text_to_speech(text: str, sarvam_key: str) -> bytes:
     return base64.b64decode(audios[0])
 
 
+@st.cache_data(show_spinner=False)
+def cached_tts(text: str, sarvam_key: str) -> bytes:
+    """Cache fixed phrases (the wake greeting) so they play instantly."""
+    return text_to_speech(text, sarvam_key)
+
+
+def wav_duration_sec(wav_bytes: bytes) -> float:
+    try:
+        with wave.open(io.BytesIO(wav_bytes)) as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return 3.0  # safe guess
+
+
 # =============================================================================
-# Secrets — loaded from Streamlit secrets manager
+# Wake-word engine — background thread that owns the microphone
 # =============================================================================
-anthropic_key = st.secrets["ANTHROPIC_API_KEY"]
-sarvam_key = st.secrets["SARVAM_API_KEY"]
+def _pcm_to_wav(frames: list[bytes], sample_rate: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(b"".join(frames))
+    return buf.getvalue()
+
+
+def _record_utterance(stream, sample_rate, frame_len, state,
+                      max_sec=10.0, silence_sec=1.3) -> bytes | None:
+    """After wake: record until the user stops speaking (energy endpointing)."""
+    state["mode"] = "recording"
+    frames, started, silent, t0 = [], False, 0.0, time.time()
+    threshold = state["threshold"]
+    while state["running"] and (time.time() - t0) < max_sec:
+        data, _ = stream.read(frame_len)
+        frames.append(bytes(data))
+        pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        rms = float(np.sqrt(np.mean(pcm * pcm))) if len(pcm) else 0.0
+        if rms > threshold:
+            started, silent = True, 0.0
+        elif started:
+            silent += frame_len / sample_rate
+            if silent >= silence_sec:
+                break
+    state["mode"] = "wake"
+    if not started:
+        return None  # user woke it but said nothing
+    return _pcm_to_wav(frames, sample_rate)
+
+
+def _wake_loop(state: dict, access_key: str, keyword: str,
+               keyword_path: str, sensitivity: float, greet_delay: float):
+    """Background thread: Porcupine wake word -> record utterance -> queue."""
+    try:
+        if keyword_path:
+            pp = pvporcupine.create(access_key=access_key,
+                                    keyword_paths=[keyword_path],
+                                    sensitivities=[sensitivity])
+        else:
+            pp = pvporcupine.create(access_key=access_key,
+                                    keywords=[keyword],
+                                    sensitivities=[sensitivity])
+    except Exception as exc:
+        state["error"] = f"Porcupine init failed: {exc}"
+        return
+    try:
+        with sd.RawInputStream(samplerate=pp.sample_rate, blocksize=pp.frame_length,
+                               dtype="int16", channels=1) as stream:
+            state["mode"] = "wake"
+            while state["running"]:
+                data, _ = stream.read(pp.frame_length)
+                if time.time() < state["muted_until"]:
+                    continue  # Astra is speaking — ignore own voice
+                pcm = np.frombuffer(data, dtype=np.int16)
+                if pp.process(pcm) >= 0:
+                    state["events"].put(("wake", None))
+                    time.sleep(greet_delay)  # let the greeting play
+                    audio = _record_utterance(stream, pp.sample_rate, pp.frame_length, state)
+                    if audio:
+                        state["events"].put(("utterance", audio))
+                    else:
+                        state["events"].put(("no_speech", None))
+    except Exception as exc:
+        state["error"] = f"Microphone stream failed: {exc}"
+    finally:
+        pp.delete()
+
+
+def start_engine(access_key, keyword, keyword_path, sensitivity, threshold, greet_delay):
+    state = {
+        "events": queue.Queue(), "mode": "starting", "running": True,
+        "muted_until": 0.0, "error": None, "threshold": threshold,
+        "params": (access_key, keyword, keyword_path, sensitivity, greet_delay),
+    }
+    t = threading.Thread(target=_wake_loop, daemon=True,
+                         args=(state, access_key, keyword, keyword_path, sensitivity, greet_delay))
+    t.start()
+    return state
+
+
+# =============================================================================
+# Keys — Streamlit secrets first, sidebar fallback (no crash if missing)
+# =============================================================================
+def secret(name: str) -> str:
+    try:
+        return st.secrets.get(name, "")
+    except Exception:
+        return ""
+
 
 # =============================================================================
 # Sidebar
 # =============================================================================
+BUILTIN_KEYWORDS = ["jarvis", "alexa", "computer", "hey google", "hey siri", "porcupine", "bumblebee"]
+
 with st.sidebar:
+    st.header("🔑 API Keys")
+    anthropic_key = secret("ANTHROPIC_API_KEY") or st.text_input("Anthropic API key", type="password")
+    sarvam_key = secret("SARVAM_API_KEY") or st.text_input("Sarvam API key", type="password")
+
+    st.divider()
+    st.header("🎤 Wake word (hands-free)")
+    if not WAKE_DEPS_OK:
+        st.warning(f"Wake-word packages missing:\n`{WAKE_DEPS_ERR}`\n\nRun: `pip install pvporcupine sounddevice numpy`")
+    pico_key = secret("PICOVOICE_ACCESS_KEY") or st.text_input(
+        "Picovoice AccessKey", type="password", help="Free at console.picovoice.ai"
+    )
+    wake_enabled = st.toggle("Always listening", value=bool(WAKE_DEPS_OK and pico_key),
+                             disabled=not (WAKE_DEPS_OK and pico_key))
+    keyword = st.selectbox("Built-in wake word", BUILTIN_KEYWORDS, index=0,
+                           help="Instant option. For 'Hey Astra', train it free on console.picovoice.ai and set the .ppn path below.")
+    keyword_path = st.text_input("Custom .ppn path (optional)", placeholder=r"C:\path\Hey-Astra_en_windows.ppn")
+    sensitivity = st.slider("Wake sensitivity", 0.1, 1.0, 0.6, 0.05)
+    mic_threshold = st.slider("Speech threshold (endpointing)", 100, 1500, 350, 50,
+                              help="Raise if it never stops recording (noisy room); lower if it cuts you off.")
+    greeting_text = st.text_input("Wake greeting", value="Yes? How can I help you?")
+
     voice_on = st.toggle("🔊 Voice replies (TTS)", value=True)
 
     st.divider()
     st.markdown("**🚀 Capabilities**")
     with st.expander("🌦️ Weather & Time"):
-        st.markdown(
-            "- *Is it going to rain in Mumbai tomorrow?*\n"
-            "- *Compare weather: Delhi vs Bengaluru*\n"
-            "- *What time is it in New York right now?*"
-        )
+        st.markdown("- *Is it going to rain in Mumbai?*\n- *What time is it in New York?*")
     with st.expander("💱 Finance"):
-        st.markdown(
-            "- *Convert 10,000 JPY to EUR*\n"
-            "- *What's the GBP to INR exchange rate?*\n"
-            "- *How much is 500 AED in USD?*"
-        )
+        st.markdown("- *Convert 10,000 JPY to EUR*\n- *GBP to INR rate?*")
     with st.expander("🎵 Music"):
-        st.markdown(
-            "- *Play Blinding Lights by The Weeknd*\n"
-            "- *Play something by AR Rahman*\n"
-            "- *Play Kesariya from Brahmastra*"
-        )
+        st.markdown("- *Play Blinding Lights*\n- *Play Kesariya from Brahmastra*")
     with st.expander("🧠 Knowledge"):
-        st.markdown(
-            "- *Explain quantum entanglement simply*\n"
-            "- *What caused the 2008 financial crisis?*\n"
-            "- *Who is Sundar Pichai?*\n"
-            "- *What is the James Webb Space Telescope?*"
-        )
+        st.markdown("- *Who is Sundar Pichai?*\n- *Explain quantum entanglement simply*")
     with st.expander("🎲 Fun & Utilities"):
-        st.markdown(
-            "- *Roll a 20-sided dice*\n"
-            "- *Flip a coin to decide something*\n"
-            "- *Tell me a dark humour joke*"
-        )
+        st.markdown("- *Roll a 20-sided dice*\n- *Tell me a joke*")
 
     st.divider()
     col1, col2 = st.columns(2)
@@ -390,32 +531,130 @@ with st.sidebar:
             st.session_state.pop(k, None)
         st.rerun()
     if col2.button("💾 Export"):
-        lines = []
-        for item in st.session_state.get("display", []):
-            ts = item.get("ts", "")
-            lines.append(f"[{ts}] {item['role'].upper()}: {item['content']}")
+        lines = [f"[{i.get('ts','')}] {i['role'].upper()}: {i['content']}"
+                 for i in st.session_state.get("display", [])]
         st.download_button("⬇️ Download", "\n".join(lines), file_name="astra_chat.txt", mime="text/plain")
 
 # =============================================================================
 # Session state
 # =============================================================================
 ss = st.session_state
-ss.setdefault("history", [])          # text-only history for Claude
-ss.setdefault("display", [])          # rich log for the UI
+ss.setdefault("history", [])
+ss.setdefault("display", [])
 ss.setdefault("last_audio_hash", "")
-ss.setdefault("status", "idle")       # idle | listening | thinking | speaking
 
 # =============================================================================
-# Status badge
+# Start / restart / stop the wake engine to match sidebar settings
 # =============================================================================
-_status_colors = {"idle": "#7a8aa0", "listening": "#19c2ff", "thinking": "#f5a623", "speaking": "#4caf50"}
-_status_icons  = {"idle": "💤", "listening": "👂", "thinking": "🧠", "speaking": "🗣️"}
-_s = ss.get("status", "idle")
-st.markdown(
-    f'<p style="text-align:center;color:{_status_colors[_s]};font-size:0.85rem">'
-    f'{_status_icons[_s]} {_s.capitalize()}</p>',
-    unsafe_allow_html=True,
-)
+engine = ss.get("engine")
+wanted_params = (pico_key, keyword, keyword_path.strip(), sensitivity, 2.0)
+
+if engine and (not wake_enabled or engine["params"] != wanted_params):
+    engine["running"] = False          # stop old thread
+    ss.engine = engine = None
+if wake_enabled and WAKE_DEPS_OK and pico_key and engine is None:
+    ss.engine = engine = start_engine(pico_key, keyword, keyword_path.strip(),
+                                      sensitivity, mic_threshold, greet_delay=2.0)
+if engine:
+    engine["threshold"] = mic_threshold  # live-tunable
+
+
+# =============================================================================
+# Shared turn processing (used by wake word, push-to-talk, and typing)
+# =============================================================================
+def process_turn(user_text: str, in_fragment: bool):
+    if not anthropic_key:
+        st.error("Anthropic API key missing (secrets or sidebar).")
+        return
+    now_ts = datetime.now().strftime("%H:%M")
+    ss.history.append({"role": "user", "content": user_text})
+    ss.display.append({"role": "user", "content": user_text, "ts": now_ts})
+
+    with st.spinner("🧠 Thinking…"):
+        try:
+            reply, tool_events = run_assistant(ss.history, anthropic_key)
+        except Exception as exc:
+            ss.history.pop(); ss.display.pop()
+            st.error(f"Claude call failed: {exc}")
+            return
+
+    tts_bytes = None
+    if voice_on and sarvam_key and reply:
+        with st.spinner("🗣️ Generating voice…"):
+            try:
+                tts_bytes = text_to_speech(reply, sarvam_key)
+            except Exception as exc:
+                st.warning(f"TTS failed (showing text only): {exc}")
+
+    # Mute the wake mic while Astra speaks, so she doesn't hear herself
+    if tts_bytes and engine:
+        engine["muted_until"] = time.time() + wav_duration_sec(tts_bytes) + 0.6
+
+    ss.history.append({"role": "assistant", "content": reply})
+    ss.display.append({"role": "assistant", "content": reply, "tools": tool_events,
+                       "tts": tts_bytes, "fresh": True, "ts": now_ts})
+    st.rerun(scope="app") if in_fragment else st.rerun()
+
+
+# =============================================================================
+# Wake-word poller — fragment that checks the mic thread's queue twice a second
+# =============================================================================
+@st.fragment(run_every=0.5)
+def wake_poller():
+    if engine is None:
+        if wake_enabled:
+            st.caption("⏳ starting wake engine…")
+        return
+    if engine.get("error"):
+        st.error(f"Wake engine: {engine['error']}")
+        return
+
+    mode = engine.get("mode", "starting")
+    badges = {
+        "starting": ("#7a8aa0", "⏳ Starting…"),
+        "wake": ("#19c2ff", f"👂 Listening for “{keyword if not keyword_path.strip() else 'Hey Astra'}”…"),
+        "recording": ("#f5a623", "🔴 Recording your question — speak now!"),
+    }
+    color, label = badges.get(mode, badges["starting"])
+    st.markdown(f'<p style="text-align:center;color:{color};font-size:0.9rem">{label}</p>',
+                unsafe_allow_html=True)
+
+    try:
+        event, payload = engine["events"].get_nowait()
+    except queue.Empty:
+        return
+
+    if event == "wake":
+        # Greet instantly (cached TTS) and mute mic for the greeting duration
+        if voice_on and sarvam_key:
+            try:
+                g = cached_tts(greeting_text, sarvam_key)
+                engine["muted_until"] = time.time() + wav_duration_sec(g) + 0.2
+                st.audio(g, format="audio/wav", autoplay=True)
+            except Exception:
+                pass
+        st.toast("👂 Wake word detected — ask your question!")
+
+    elif event == "no_speech":
+        st.toast("Didn't hear a question — say the wake word again.")
+
+    elif event == "utterance":
+        if not sarvam_key:
+            st.error("Sarvam API key missing — can't transcribe.")
+            return
+        with st.spinner("👂 Transcribing…"):
+            try:
+                text = speech_to_text(payload, sarvam_key)
+            except Exception as exc:
+                st.error(f"STT failed: {exc}")
+                return
+        if not text:
+            st.toast("Couldn't understand that — try again.")
+            return
+        process_turn(text, in_fragment=True)
+
+
+wake_poller()
 
 # =============================================================================
 # Render conversation
@@ -435,7 +674,8 @@ for item in ss.display:
                 st.audio(r["preview_url"], autoplay=item.get("fresh", False))
             elif ev["name"] == "get_weather" and "temperature_c" in r:
                 c1, c2, c3 = st.columns(3)
-                c1.metric(f"{r['city']} — {r['condition'].title()}", f"{r['temperature_c']} °C", f"feels like {r['feels_like_c']} °C")
+                c1.metric(f"{r['city']} — {r['condition'].title()}", f"{r['temperature_c']} °C",
+                          f"feels like {r['feels_like_c']} °C")
                 c2.metric("💧 Humidity", f"{r.get('humidity_pct', '—')} %")
                 c3.metric("💨 Wind", f"{r.get('wind_kmh', '—')} km/h")
             elif ev["name"] == "convert_currency" and "to" in r:
@@ -450,36 +690,37 @@ for item in ss.display:
                 st.success(f"{label}: **{r['result']}**")
         if item.get("tts"):
             st.audio(item["tts"], format="audio/wav", autoplay=item.get("fresh", False))
-        item["fresh"] = False  # autoplay only once
+        item["fresh"] = False
 
 # =============================================================================
-# Input — push-to-talk mic + text fallback
+# Fallback inputs — push-to-talk + text (work even without the wake engine)
 # =============================================================================
-from streamlit_mic_recorder import mic_recorder
-rec = mic_recorder(start_prompt="🎙️ Start speaking", stop_prompt="⏹️ Stop", format="wav", key="mic")
 audio = None
-if rec and rec.get("bytes"):
-    import io
-    audio = io.BytesIO(rec["bytes"])
+try:
+    from streamlit_mic_recorder import mic_recorder
+    rec = mic_recorder(start_prompt="🎙️ Push to talk", stop_prompt="⏹️ Stop",
+                       format="wav", key="mic")
+    if rec and rec.get("bytes"):
+        audio = io.BytesIO(rec["bytes"])
+except Exception:
+    st.caption("Push-to-talk unavailable (`pip install streamlit-mic-recorder`) — typing still works.")
+
 typed = st.chat_input("…or type your request")
 
 user_text = None
-
 if audio is not None:
     raw = audio.getvalue()
     h = hashlib.md5(raw).hexdigest()
-    if h != ss.last_audio_hash:  # don't reprocess the same clip on rerun
+    if h != ss.last_audio_hash:
         ss.last_audio_hash = h
         if not sarvam_key:
-            st.error("SARVAM_API_KEY missing from Streamlit secrets.")
+            st.error("Sarvam API key missing (secrets or sidebar).")
         else:
-            ss.status = "listening"
             with st.spinner("👂 Transcribing…"):
                 try:
                     user_text = speech_to_text(raw, sarvam_key)
                 except Exception as exc:
                     st.error(f"STT failed: {exc}")
-            ss.status = "idle"
             if user_text == "":
                 st.warning("Didn't catch that — try again a bit louder.")
                 user_text = None
@@ -487,41 +728,5 @@ if audio is not None:
 if typed:
     user_text = typed.strip()
 
-# =============================================================================
-# One assistant turn
-# =============================================================================
 if user_text:
-    if not anthropic_key:
-        st.error("ANTHROPIC_API_KEY missing from Streamlit secrets.")
-        st.stop()
-
-    now_ts = datetime.now().strftime("%H:%M")
-    ss.history.append({"role": "user", "content": user_text})
-    ss.display.append({"role": "user", "content": user_text, "ts": now_ts})
-
-    ss.status = "thinking"
-    with st.spinner("🧠 Thinking…"):
-        try:
-            reply, tool_events = run_assistant(ss.history, anthropic_key)
-        except Exception as exc:
-            ss.history.pop()
-            ss.display.pop()
-            ss.status = "idle"
-            st.error(f"Claude call failed: {exc}")
-            st.stop()
-
-    tts_bytes = None
-    if voice_on and sarvam_key and reply:
-        ss.status = "speaking"
-        with st.spinner("🗣️ Generating voice…"):
-            try:
-                tts_bytes = text_to_speech(reply, sarvam_key)
-            except Exception as exc:
-                st.warning(f"TTS failed (showing text only): {exc}")
-
-    ss.status = "idle"
-    ss.history.append({"role": "assistant", "content": reply})
-    ss.display.append(
-        {"role": "assistant", "content": reply, "tools": tool_events, "tts": tts_bytes, "fresh": True, "ts": now_ts}
-    )
-    st.rerun()
+    process_turn(user_text, in_fragment=False)
